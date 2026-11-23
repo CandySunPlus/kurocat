@@ -1,6 +1,5 @@
 #![cfg(windows)]
 
-use crate::config::save_settings;
 use crate::AppState;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
@@ -340,11 +339,9 @@ fn persist_hwnd_position(hwnd: HWND) {
     }
     let app_opt = hub().app.lock().unwrap().clone();
     if let Some(app) = app_opt {
-        let state = app.state::<AppState>();
-        let mut s = state.settings.lock().unwrap();
-        s.x = Some(rc.left);
-        s.y = Some(rc.top);
-        save_settings(&s);
+        crate::windows_display::remember_dragged_position(
+            &app, tauri::PhysicalPosition::new(rc.left, rc.top),
+        );
     }
 }
 

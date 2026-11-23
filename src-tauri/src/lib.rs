@@ -9,6 +9,8 @@ mod tray;
 mod updater;
 #[cfg(windows)]
 mod win7_layered;
+#[cfg(windows)]
+mod windows_display;
 
 #[cfg(windows)]
 const WIN7_OFFSCREEN_PARK_POS: i32 = -16000;
@@ -54,6 +56,13 @@ fn resize_window_anchored_bottom_right(
     scale: f64,
 ) -> Option<(i32, i32)> {
     let (new_w, new_h) = window_dimensions(layout, scale);
+    #[cfg(windows)]
+    {
+        let preferred = win.state::<AppState>().settings.lock().unwrap().windows_display_id.clone();
+        if let Some(id) = preferred.as_deref() {
+            return windows_display::resize_pinned(win, id, new_w, new_h);
+        }
+    }
     let sf = win.scale_factor().unwrap_or(1.0);
 
     #[cfg(windows)]
@@ -63,8 +72,8 @@ fn resize_window_anchored_bottom_right(
         let new_pw = (new_w * sf).round() as i32;
         let new_ph = (new_h * sf).round() as i32;
         if let Some((ox, oy, ow, oh)) = old_rect {
-            let new_x = (ox + ow - new_pw).max(0);
-            let new_y = (oy + oh - new_ph).max(0);
+            let new_x = ox + ow - new_pw;
+            let new_y = oy + oh - new_ph;
             if new_x != ox || new_y != oy {
                 win7_layered::set_position(new_x, new_y);
             }
@@ -88,8 +97,12 @@ fn resize_window_anchored_bottom_right(
     if let (Some(pos), Some(sz)) = (old_pos, old_size) {
         let new_pw = (new_w * sf).round() as i32;
         let new_ph = (new_h * sf).round() as i32;
-        let new_x = (pos.x + sz.width as i32 - new_pw).max(0);
-        let new_y = (pos.y + sz.height as i32 - new_ph).max(0);
+        let (new_x, new_y) = (
+            pos.x + sz.width as i32 - new_pw,
+            pos.y + sz.height as i32 - new_ph,
+        );
+        #[cfg(not(windows))]
+        let (new_x, new_y) = (new_x.max(0), new_y.max(0));
         if new_x != pos.x || new_y != pos.y {
             let _ = win.set_position(PhysicalPosition::new(new_x, new_y));
         }
@@ -258,6 +271,14 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
 
     {
         let mut s = state.settings.lock().unwrap();
+        #[cfg(windows)]
+        {
+            patch.windows_display_id = s.windows_display_id.clone();
+            if !size_changed {
+                patch.x = s.x;
+                patch.y = s.y;
+            }
+        }
         *s = patch.clone();
         save_settings(&s);
     }
@@ -305,17 +326,8 @@ fn open_release_page(url: String) {
 }
 
 #[tauri::command]
+#[cfg(not(windows))]
 fn save_window_pos(app: AppHandle, state: State<'_, AppState>) {
-    #[cfg(windows)]
-    if win_needs_win7_ulw() {
-        if let Some((x, y, _, _)) = win7_layered::get_rect() {
-            let mut s = state.settings.lock().unwrap();
-            s.x = Some(x);
-            s.y = Some(y);
-            save_settings(&s);
-        }
-        return;
-    }
     if let Some(win) = app.get_webview_window("main") {
         if let Ok(pos) = win.outer_position() {
             let mut s = state.settings.lock().unwrap();
@@ -323,6 +335,18 @@ fn save_window_pos(app: AppHandle, state: State<'_, AppState>) {
             s.y = Some(pos.y);
             save_settings(&s);
         }
+    }
+}
+
+#[tauri::command]
+#[cfg(windows)]
+fn save_window_pos(app: AppHandle) {
+    if win_needs_win7_ulw() {
+        if let Some((x, y, _, _)) = win7_layered::get_rect() {
+            windows_display::remember_dragged_position(&app, PhysicalPosition::new(x, y));
+        }
+    } else if let Some(position) = app.get_webview_window("main").and_then(|win| win.outer_position().ok()) {
+        windows_display::remember_dragged_position(&app, position);
     }
 }
 
@@ -360,17 +384,21 @@ pub fn apply_breed_and_save(app: &AppHandle, breed: &str) {
 }
 
 pub fn reload_and_emit_all(app: &AppHandle) {
-    let disk_settings = load_settings();
     let cats = all_cats();
     let state = app.state::<AppState>();
 
-    let (size_changed, top_changed) = {
+    let (disk_settings, size_changed, top_changed, display_changed) = {
         let mut s = state.settings.lock().unwrap();
+        let disk_settings = load_settings();
         let sc = (s.scale - disk_settings.scale).abs() > 0.01
             || s.keyboard_layout != disk_settings.keyboard_layout;
         let tc = s.always_on_top != disk_settings.always_on_top;
+        #[cfg(windows)]
+        let display_changed = s.windows_display_id != disk_settings.windows_display_id;
+        #[cfg(not(windows))]
+        let display_changed = false;
         *s = disk_settings.clone();
-        (sc, tc)
+        (disk_settings, sc, tc, display_changed)
     };
     state
         .mcp_enabled
@@ -379,6 +407,12 @@ pub fn reload_and_emit_all(app: &AppHandle) {
     if top_changed {
         set_pet_always_on_top(app, disk_settings.always_on_top);
     }
+    #[cfg(windows)]
+    if display_changed {
+        windows_display::refresh_placement(app);
+    }
+    #[cfg(not(windows))]
+    let _ = display_changed;
     if let Some(win) = app.get_webview_window("main") {
         if size_changed {
             let _ = resize_window_anchored_bottom_right(
@@ -471,6 +505,10 @@ pub fn apply_keyboard_orientation_and_save(app: &AppHandle, orientation: &str) {
 
 pub fn reset_window_position(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        #[cfg(windows)]
+        if windows_display::reset_position(app, &win) {
+            return;
+        }
         let size = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
         let sf = win.scale_factor().unwrap_or(1.0);
         #[cfg(windows)]
@@ -1544,6 +1582,13 @@ pub fn run() {
                 } else {
                     default_bottom_right_position(sz.width as i32, sz.height as i32, sf)
                 };
+                #[cfg(windows)]
+                let (target_x, target_y, sz, anchored) = {
+                    match windows_display::initial_placement(&win, &s) {
+                        Some(target) => (target.position.x, target.position.y, target.size, true),
+                        None => (target_x, target_y, sz, false),
+                    }
+                };
 
                 #[cfg(windows)]
                 if win_needs_win7_ulw() {
@@ -1556,6 +1601,9 @@ pub fn run() {
                         WIN7_OFFSCREEN_PARK_POS,
                         WIN7_OFFSCREEN_PARK_POS,
                     ));
+                    if anchored {
+                        let _ = win.set_size(sz);
+                    }
                     win7_layered::init(
                         handle.clone(),
                         target_x,
@@ -1567,6 +1615,9 @@ pub fn run() {
                 } else {
                     let _ = win.set_always_on_top(s.always_on_top);
                     let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+                    if anchored {
+                        let _ = win.set_size(sz);
+                    }
                 }
 
                 #[cfg(not(windows))]

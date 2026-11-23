@@ -20,6 +20,8 @@ fn default_tray_tooltip() -> &'static str {
 }
 
 pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
+    #[cfg(windows)]
+    let display_menu = crate::windows_display::create_menu(app)?;
     let toggle_show = MenuItem::with_id(app, "toggle_show", "显示 / 隐藏小黑猫", true, None::<&str>)?;
     let pause_guard = CheckMenuItem::with_id(
         app,
@@ -220,6 +222,7 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
             &kb_menu,
             &scale_menu,
             &desktop_shortcut,
+            &display_menu,
             &reset_pos,
             &autostart,
             &mcp_toggle,
@@ -498,7 +501,10 @@ pub fn setup_tray(app: &AppHandle, initial: &AppSettings) -> tauri::Result<()> {
                     shutdown_pet_windows();
                     app.exit(0);
                 }
-                _ => {}
+                _ => {
+                    #[cfg(windows)]
+                    crate::windows_display::handle_menu(app, event.id().as_ref());
+                }
             }
         })
         .build(app)?;
