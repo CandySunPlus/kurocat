@@ -3,6 +3,8 @@
 mod cats;
 mod config;
 mod input_hook;
+#[cfg(target_os = "macos")]
+mod macos_window;
 mod mcp;
 mod privacy;
 mod tray;
@@ -54,6 +56,18 @@ fn resize_window_anchored_bottom_right(
     scale: f64,
 ) -> Option<(i32, i32)> {
     let (new_w, new_h) = window_dimensions(layout, scale);
+    #[cfg(target_os = "macos")]
+    if win
+        .state::<AppState>()
+        .settings
+        .lock()
+        .unwrap()
+        .display_id
+        .is_some()
+    {
+        macos_window::resize_pinned(win, new_w, new_h);
+        return None;
+    }
     let sf = win.scale_factor().unwrap_or(1.0);
 
     #[cfg(windows)]
@@ -88,8 +102,12 @@ fn resize_window_anchored_bottom_right(
     if let (Some(pos), Some(sz)) = (old_pos, old_size) {
         let new_pw = (new_w * sf).round() as i32;
         let new_ph = (new_h * sf).round() as i32;
-        let new_x = (pos.x + sz.width as i32 - new_pw).max(0);
-        let new_y = (pos.y + sz.height as i32 - new_ph).max(0);
+        let (new_x, new_y) = (
+            pos.x + sz.width as i32 - new_pw,
+            pos.y + sz.height as i32 - new_ph,
+        );
+        #[cfg(not(target_os = "macos"))]
+        let (new_x, new_y) = (new_x.max(0), new_y.max(0));
         if new_x != pos.x || new_y != pos.y {
             let _ = win.set_position(PhysicalPosition::new(new_x, new_y));
         }
@@ -154,9 +172,10 @@ pub fn set_pet_always_on_top(app: &AppHandle, on_top: bool) {
         win7_layered::set_always_on_top(on_top);
     }
     if let Some(win) = app.get_webview_window("main") {
-        let _ = win.set_always_on_top(on_top);
         #[cfg(target_os = "macos")]
-        configure_macos_fullscreen_overlay(&win, on_top);
+        macos_window::configure_fullscreen(&win, on_top);
+        #[cfg(not(target_os = "macos"))]
+        let _ = win.set_always_on_top(on_top);
     }
 }
 
@@ -258,6 +277,15 @@ fn update_settings(app: AppHandle, state: State<'_, AppState>, mut patch: AppSet
 
     {
         let mut s = state.settings.lock().unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // Display placement is changed by the native menu and window drag, not by web settings.
+            patch.display_id = s.display_id.clone();
+            if patch.display_id.is_some() || !size_changed {
+                patch.x = s.x;
+                patch.y = s.y;
+            }
+        }
         *s = patch.clone();
         save_settings(&s);
     }
@@ -305,6 +333,7 @@ fn open_release_page(url: String) {
 }
 
 #[tauri::command]
+#[cfg(not(target_os = "macos"))]
 fn save_window_pos(app: AppHandle, state: State<'_, AppState>) {
     #[cfg(windows)]
     if win_needs_win7_ulw() {
@@ -324,6 +353,39 @@ fn save_window_pos(app: AppHandle, state: State<'_, AppState>) {
             save_settings(&s);
         }
     }
+}
+
+#[tauri::command]
+#[cfg(target_os = "macos")]
+fn save_window_pos(app: AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window("main") else {
+            return;
+        };
+        let Ok(position) = win.outer_position() else {
+            return;
+        };
+        let state = handle.state::<AppState>();
+        let unpinned = {
+            let mut settings = state.settings.lock().unwrap();
+            let unpinned = settings
+                .display_id
+                .as_deref()
+                .is_some_and(|id| !macos_window::is_at_display_corner(&win, id));
+            if unpinned {
+                settings.display_id = None;
+            }
+            settings.x = Some(position.x);
+            settings.y = Some(position.y);
+            save_settings(&settings);
+            unpinned.then(|| settings.clone())
+        };
+        if let Some(settings) = unpinned {
+            let _ = macos_window::refresh_menu(&handle);
+            let _ = handle.emit("kuro-settings", settings);
+        }
+    });
 }
 
 #[tauri::command]
@@ -360,17 +422,21 @@ pub fn apply_breed_and_save(app: &AppHandle, breed: &str) {
 }
 
 pub fn reload_and_emit_all(app: &AppHandle) {
-    let disk_settings = load_settings();
     let cats = all_cats();
     let state = app.state::<AppState>();
 
-    let (size_changed, top_changed) = {
+    let (disk_settings, size_changed, top_changed, display_changed) = {
         let mut s = state.settings.lock().unwrap();
+        let disk_settings = load_settings();
         let sc = (s.scale - disk_settings.scale).abs() > 0.01
             || s.keyboard_layout != disk_settings.keyboard_layout;
         let tc = s.always_on_top != disk_settings.always_on_top;
+        #[cfg(target_os = "macos")]
+        let display_changed = s.display_id != disk_settings.display_id;
+        #[cfg(not(target_os = "macos"))]
+        let display_changed = false;
         *s = disk_settings.clone();
-        (sc, tc)
+        (disk_settings, sc, tc, display_changed)
     };
     state
         .mcp_enabled
@@ -379,6 +445,16 @@ pub fn reload_and_emit_all(app: &AppHandle) {
     if top_changed {
         set_pet_always_on_top(app, disk_settings.always_on_top);
     }
+    #[cfg(target_os = "macos")]
+    if display_changed {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            macos_window::restore_pinned_position(&handle);
+            let _ = macos_window::refresh_menu(&handle);
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = display_changed;
     if let Some(win) = app.get_webview_window("main") {
         if size_changed {
             let _ = resize_window_anchored_bottom_right(
@@ -469,6 +545,26 @@ pub fn apply_keyboard_orientation_and_save(app: &AppHandle, orientation: &str) {
     let _ = app.emit("kuro-settings", updated);
 }
 
+#[cfg(target_os = "macos")]
+pub fn reset_window_position(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(win) = handle.get_webview_window("main") else {
+            return;
+        };
+        let state = handle.state::<AppState>();
+        let mut settings = state.settings.lock().unwrap();
+        if macos_window::place(&win, settings.display_id.as_deref()) {
+            if let Ok(position) = win.outer_position() {
+                settings.x = Some(position.x);
+                settings.y = Some(position.y);
+                save_settings(&settings);
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn reset_window_position(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let size = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
@@ -515,16 +611,6 @@ fn default_bottom_right_position(win_w: i32, win_h: i32, _scale_factor: f64) -> 
         let sh = GetSystemMetrics(SM_CYSCREEN);
         ((sw - win_w - 28).max(20), (sh - win_h - 68).max(20))
     }
-}
-
-#[cfg(target_os = "macos")]
-fn default_bottom_right_position(win_w: i32, win_h: i32, scale_factor: f64) -> (i32, i32) {
-    let (sw_pt, sh_pt) = input_hook::macos_hook::main_display_size();
-    let sw = (sw_pt * scale_factor).round() as i32;
-    let sh = (sh_pt * scale_factor).round() as i32;
-    let pad_x = (28.0 * scale_factor).round() as i32;
-    let pad_y = (84.0 * scale_factor).round() as i32;
-    ((sw - win_w - pad_x).max(20), (sh - win_h - pad_y).max(20))
 }
 
 #[cfg(target_os = "linux")]
@@ -892,42 +978,6 @@ fn win_wait_for_previous_pid_if_requested() {
                 }
             }
             break;
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-pub fn configure_macos_fullscreen_overlay(win: &tauri::WebviewWindow, always_on_top: bool) {
-    use std::ffi::{c_char, c_void};
-    #[link(name = "objc")]
-    extern "C" {
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-    if let Ok(raw_ns_win) = win.ns_window() {
-        if raw_ns_win.is_null() {
-            return;
-        }
-        unsafe {
-            let sel_get_behavior =
-                sel_registerName(b"collectionBehavior\0".as_ptr() as *const c_char);
-            let sel_set_behavior =
-                sel_registerName(b"setCollectionBehavior:\0".as_ptr() as *const c_char);
-            let sel_set_level = sel_registerName(b"setLevel:\0".as_ptr() as *const c_char);
-
-            let get_fn: extern "C" fn(*mut c_void, *mut c_void) -> usize =
-                std::mem::transmute(objc_msgSend as *const ());
-            let set_usize_fn: extern "C" fn(*mut c_void, *mut c_void, usize) =
-                std::mem::transmute(objc_msgSend as *const ());
-            let set_isize_fn: extern "C" fn(*mut c_void, *mut c_void, isize) =
-                std::mem::transmute(objc_msgSend as *const ());
-
-            let cur = get_fn(raw_ns_win, sel_get_behavior);
-            // CanJoinAllSpaces (1 << 0) | Stationary (1 << 4) | FullScreenAuxiliary (1 << 8)
-            let next = cur | (1 << 0) | (1 << 4) | (1 << 8);
-            set_usize_fn(raw_ns_win, sel_set_behavior, next);
-            // NSStatusWindowLevel = 25 (floats above native fullscreen apps/games), Normal = 0
-            set_isize_fn(raw_ns_win, sel_set_level, if always_on_top { 25 } else { 0 });
         }
     }
 }
@@ -1537,13 +1587,19 @@ pub fn run() {
             if let Some(win) = app.get_webview_window("main") {
                 let (win_w, win_h) = window_dimensions(&s.keyboard_layout, s.scale);
                 let _ = win.set_size(Size::Logical(LogicalSize::new(win_w, win_h)));
-                let sz = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
-                let sf = win.scale_factor().unwrap_or(1.0);
-                let (target_x, target_y) = if let (Some(x), Some(y)) = (s.x, s.y) {
-                    (x, y)
-                } else {
-                    default_bottom_right_position(sz.width as i32, sz.height as i32, sf)
+                #[cfg(not(target_os = "macos"))]
+                let (target_x, target_y, sz) = {
+                    let sz = win.outer_size().unwrap_or(tauri::PhysicalSize::new(420, 440));
+                    let sf = win.scale_factor().unwrap_or(1.0);
+                    let (x, y) = if let (Some(x), Some(y)) = (s.x, s.y) {
+                        (x, y)
+                    } else {
+                        default_bottom_right_position(sz.width as i32, sz.height as i32, sf)
+                    };
+                    (x, y, sz)
                 };
+                #[cfg(all(not(windows), not(target_os = "macos")))]
+                let _ = sz;
 
                 #[cfg(windows)]
                 if win_needs_win7_ulw() {
@@ -1569,20 +1625,28 @@ pub fn run() {
                     let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
                 }
 
-                #[cfg(not(windows))]
+                #[cfg(all(not(windows), not(target_os = "macos")))]
                 {
                     let _ = win.set_always_on_top(s.always_on_top);
-                    #[cfg(target_os = "macos")]
-                    {
-                        let _ = win.set_visible_on_all_workspaces(true);
-                        configure_macos_fullscreen_overlay(&win, s.always_on_top);
-                    }
                     #[cfg(target_os = "linux")]
                     {
                         let _ = win.set_visible_on_all_workspaces(true);
                         let _ = win.set_skip_taskbar(true);
                     }
                     let _ = win.set_position(PhysicalPosition::new(target_x, target_y));
+                }
+
+                #[cfg(target_os = "macos")]
+                {
+                    macos_window::configure_fullscreen(&win, s.always_on_top);
+                    match (s.display_id.as_deref(), s.x, s.y) {
+                        (None, Some(x), Some(y)) => {
+                            let _ = win.set_position(PhysicalPosition::new(x, y));
+                        }
+                        (preferred, _, _) => {
+                            macos_window::place(&win, preferred);
+                        }
+                    }
                 }
             }
 

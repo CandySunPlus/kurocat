@@ -51,6 +51,9 @@ pub fn normalize_keyboard_orientation(raw: &str) -> String {
 pub struct AppSettings {
     pub x: Option<i32>,
     pub y: Option<i32>,
+    #[cfg(target_os = "macos")]
+    #[serde(default)]
+    pub display_id: Option<String>,
     pub scale: f64,
     pub always_on_top: bool,
     pub click_through_locked: bool,
@@ -76,6 +79,8 @@ impl Default for AppSettings {
         Self {
             x: None,
             y: None,
+            #[cfg(target_os = "macos")]
+            display_id: None,
             scale: 1.0,
             always_on_top: true,
             click_through_locked: false,

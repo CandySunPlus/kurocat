@@ -683,6 +683,9 @@ pub fn perform_update_install(app: &AppHandle, info: UpdateInfo) -> Result<(), S
 
     #[cfg(target_os = "macos")]
     {
+        if option_env!("KUROCAT_LOCAL_SIGNING").is_some() {
+            return Err("请用 scripts/build-macos-local.sh 从项目源码构建更新，以保留本机签名和授权。".into());
+        }
         return install_macos_update(app, &info);
     }
 
