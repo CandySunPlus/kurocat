@@ -589,9 +589,10 @@ pub fn start_global_hooks(app: AppHandle) {
     });
 
     #[cfg(target_os = "macos")]
-    std::thread::spawn(|| {
-        macos_hook::run_macos_hook_loop();
-    });
+    {
+        macos_hook::install_wake_observers();
+        std::thread::spawn(macos_hook::run_macos_hook_loop);
+    }
 
     #[cfg(target_os = "linux")]
     std::thread::spawn(|| {
@@ -817,7 +818,14 @@ fn run_windows_hook_loop() {
 #[cfg(target_os = "macos")]
 pub mod macos_hook {
     use super::{hid_usage_to_vk, KeySource, RawHookMsg, HOOK_TX, KEY_EVENTS_RECEIVED};
+    use block2::{Block, RcBlock};
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification,
+        NSWorkspaceSessionDidBecomeActiveNotification,
+    };
+    use objc2_foundation::NSNotification;
     use std::ffi::c_void;
+    use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -946,6 +954,7 @@ pub mod macos_hook {
     #[link(name = "CoreFoundation", kind = "framework")]
     extern "C" {
         static kCFRunLoopCommonModes: CFStringRef;
+        static kCFRunLoopDefaultMode: CFStringRef;
         static kCFBooleanTrue: CFBooleanRef;
         static kCFTypeDictionaryKeyCallBacks: u8;
         static kCFTypeDictionaryValueCallBacks: u8;
@@ -988,6 +997,8 @@ pub mod macos_hook {
         fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
         fn CFRunLoopRun();
         fn CFRunLoopStop(rl: CFRunLoopRef);
+        fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFStringRef, block: &Block<dyn Fn()>);
+        fn CFRunLoopWakeUp(rl: CFRunLoopRef);
         fn CFAbsoluteTimeGetCurrent() -> f64;
         fn CFRunLoopTimerCreate(
             allocator: CFAllocatorRef,
@@ -1037,7 +1048,9 @@ pub mod macos_hook {
         fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
     }
 
+    static HOOK_RUN_LOOP: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
     static TAP_PORT: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+    static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
     static TAP_HAS_KEYBOARD: AtomicBool = AtomicBool::new(false);
     static HID_ACTIVE: AtomicBool = AtomicBool::new(false);
     static SNAPSHOT_AX: AtomicBool = AtomicBool::new(false);
@@ -1045,6 +1058,46 @@ pub mod macos_hook {
     static RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
     static LAST_TICK_WALL_MS: AtomicU64 = AtomicU64::new(0);
     static LAST_HID_RETRY_WALL_MS: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn install_wake_observers() {
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        let observer = RcBlock::new(|_: NonNull<NSNotification>| request_reconnect());
+        // NSWorkspace retains these capture-free callbacks for the lifetime of the app.
+        unsafe {
+            for name in [
+                NSWorkspaceDidWakeNotification,
+                NSWorkspaceScreensDidWakeNotification,
+                NSWorkspaceSessionDidBecomeActiveNotification,
+            ] {
+                center.addObserverForName_object_queue_usingBlock(
+                    Some(name),
+                    None,
+                    None,
+                    &observer,
+                );
+            }
+        }
+    }
+
+    fn request_reconnect() {
+        if RECONNECT_REQUESTED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let rl = HOOK_RUN_LOOP.load(Ordering::Acquire);
+        if !rl.is_null() {
+            let stop = RcBlock::new(|| unsafe {
+                if RECONNECT_REQUESTED.swap(false, Ordering::AcqRel) {
+                    CFRunLoopStop(CFRunLoopGetCurrent());
+                }
+            });
+            // The worker owns this run loop for the lifetime of the app. Schedule cleanup
+            // on that same thread and wake it even when the watchdog has not fired.
+            unsafe {
+                CFRunLoopPerformBlock(rl, kCFRunLoopDefaultMode, &stop);
+                CFRunLoopWakeUp(rl);
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub struct MacInputStatus {
@@ -1064,12 +1117,10 @@ pub mod macos_hook {
     }
 
     pub fn get_macos_input_status() -> MacInputStatus {
-        let tap = TAP_PORT.load(Ordering::Acquire);
-        let tap_active = !tap.is_null() && unsafe { CGEventTapIsEnabled(tap) };
         MacInputStatus {
             accessibility: unsafe { AXIsProcessTrusted() },
             input_monitoring: unsafe { CGPreflightListenEventAccess() },
-            tap_active,
+            tap_active: TAP_ACTIVE.load(Ordering::Acquire),
             tap_has_keyboard: TAP_HAS_KEYBOARD.load(Ordering::Acquire),
             hid_active: HID_ACTIVE.load(Ordering::Acquire),
             key_events_received: KEY_EVENTS_RECEIVED.load(Ordering::Relaxed),
@@ -1082,7 +1133,7 @@ pub mod macos_hook {
                 let _ = CGRequestListenEventAccess();
             }
         }
-        RECONNECT_REQUESTED.store(true, Ordering::Release);
+        request_reconnect();
     }
 
     pub fn open_macos_privacy_pane(pane: &str) {
@@ -1547,7 +1598,7 @@ pub mod macos_hook {
     /// Periodic self-healing watchdog running on the exact same CFRunLoop thread.
     /// Automatically tears down & rebuilds listeners when:
     /// 1. The user grants Input Monitoring or Accessibility after launch (no restart needed!)
-    /// 2. The Mac wakes from sleep (wall-clock jump > 12s, where Karabiner/WindowServer taps often stale)
+    /// 2. A long gap suggests sleep, as a fallback for missed workspace notifications
     /// 3. The CGEventTap gets disabled and cannot be re-enabled in place
     /// 4. The user clicks "重新连接键盘监听" in the menu bar
     extern "C" fn health_timer_callback(_timer: CFRunLoopTimerRef, _info: *mut c_void) {
@@ -1560,7 +1611,7 @@ pub mod macos_hook {
             let listen_now = CGPreflightListenEventAccess();
             let ax_upgraded = !SNAPSHOT_AX.load(Ordering::Acquire) && ax_now;
             let listen_upgraded = !SNAPSHOT_LISTEN.load(Ordering::Acquire) && listen_now;
-            let manual_reconnect = RECONNECT_REQUESTED.swap(false, Ordering::AcqRel);
+            let reconnect_requested = RECONNECT_REQUESTED.swap(false, Ordering::AcqRel);
 
             let tap = TAP_PORT.load(Ordering::Acquire);
             let mut tap_dead = false;
@@ -1574,12 +1625,13 @@ pub mod macos_hook {
             } else if ax_now || listen_now {
                 tap_dead = true;
             }
+            TAP_ACTIVE.store(!tap.is_null() && !tap_dead, Ordering::Release);
 
             let hid_needs_retry = !HID_ACTIVE.load(Ordering::Acquire)
                 && listen_now
                 && now_ms.saturating_sub(LAST_HID_RETRY_WALL_MS.load(Ordering::Acquire)) > 15_000;
 
-            if manual_reconnect
+            if reconnect_requested
                 || ax_upgraded
                 || listen_upgraded
                 || woke_from_sleep
@@ -1603,6 +1655,9 @@ pub mod macos_hook {
     }
 
     pub fn run_macos_hook_loop() {
+        let rl = unsafe { CFRunLoopGetCurrent() };
+        HOOK_RUN_LOOP.store(rl, Ordering::Release);
+
         // Trigger both Accessibility and Input Monitoring prompts once on first launch
         request_permissions_once();
 
@@ -1637,8 +1692,6 @@ pub mod macos_hook {
                 SNAPSHOT_AX.store(ax_ok, Ordering::Release);
                 SNAPSHOT_LISTEN.store(listen_ok, Ordering::Release);
                 LAST_TICK_WALL_MS.store(wall_clock_ms(), Ordering::Release);
-
-                let rl = CFRunLoopGetCurrent();
 
                 // Channel 1: CGEventTap (mouse + keyboard; prefers passive LISTEN_ONLY, falls back
                 // to pass-through DEFAULT tap if ListenEvent TCC is lagging behind Accessibility,
@@ -1682,6 +1735,7 @@ pub mod macos_hook {
                         TAP_HAS_KEYBOARD.store(tap_has_kb, Ordering::Release);
                         CFRunLoopAddSource(rl, tap_src, kCFRunLoopCommonModes);
                         CGEventTapEnable(tap, true);
+                        TAP_ACTIVE.store(CGEventTapIsEnabled(tap), Ordering::Release);
                     } else {
                         CFMachPortInvalidate(tap);
                         CFRelease(tap as *const c_void);
@@ -1742,6 +1796,7 @@ pub mod macos_hook {
                     CFRelease(hid_mgr as *const c_void);
                 }
                 if !tap.is_null() {
+                    TAP_ACTIVE.store(false, Ordering::Release);
                     TAP_PORT.store(std::ptr::null_mut(), Ordering::Release);
                     TAP_HAS_KEYBOARD.store(false, Ordering::Release);
                     if !tap_src.is_null() {
@@ -1753,6 +1808,64 @@ pub mod macos_hook {
                 }
             }
             std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    #[cfg(test)]
+    mod wake_tests {
+        use super::*;
+        use std::sync::mpsc;
+
+        #[link(name = "CoreFoundation", kind = "framework")]
+        extern "C" {
+            fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
+        }
+
+        extern "C" fn keep_run_loop_open(_: CFRunLoopTimerRef, _: *mut c_void) {}
+
+        #[test]
+        fn workspace_resume_requests_reconnect_without_a_watchdog_gap() {
+            install_wake_observers();
+            let center = NSWorkspace::sharedWorkspace().notificationCenter();
+            for name in unsafe {
+                [
+                    NSWorkspaceDidWakeNotification,
+                    NSWorkspaceScreensDidWakeNotification,
+                    NSWorkspaceSessionDidBecomeActiveNotification,
+                ]
+            } {
+                unsafe { center.postNotificationName_object(name, None) };
+                assert!(RECONNECT_REQUESTED.swap(false, Ordering::AcqRel), "{name}");
+            }
+
+            let (ready, wait_for_worker) = mpsc::channel();
+            let worker = std::thread::spawn(move || unsafe {
+                let rl = CFRunLoopGetCurrent();
+                let timer = CFRunLoopTimerCreate(
+                    std::ptr::null(),
+                    CFAbsoluteTimeGetCurrent() + 10.0,
+                    0.0,
+                    0,
+                    0,
+                    keep_run_loop_open,
+                    std::ptr::null_mut(),
+                );
+                assert!(!timer.is_null());
+                CFRunLoopAddTimer(rl, timer, kCFRunLoopDefaultMode);
+                HOOK_RUN_LOOP.store(rl, Ordering::Release);
+                ready.send(()).unwrap();
+                let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3.0, 0);
+                HOOK_RUN_LOOP.store(std::ptr::null_mut(), Ordering::Release);
+                CFRunLoopTimerInvalidate(timer);
+                CFRelease(timer);
+                result
+            });
+            wait_for_worker
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            unsafe { center.postNotificationName_object(NSWorkspaceDidWakeNotification, None) };
+            const K_CF_RUN_LOOP_RUN_STOPPED: i32 = 2;
+            assert_eq!(worker.join().unwrap(), K_CF_RUN_LOOP_RUN_STOPPED);
         }
     }
 }
