@@ -589,10 +589,7 @@ pub fn start_global_hooks(app: AppHandle) {
     });
 
     #[cfg(target_os = "macos")]
-    {
-        macos_hook::install_wake_observers();
-        std::thread::spawn(macos_hook::run_macos_hook_loop);
-    }
+    macos_hook::start_input_listeners();
 
     #[cfg(target_os = "linux")]
     std::thread::spawn(|| {
@@ -827,6 +824,7 @@ pub mod macos_hook {
     use std::ffi::c_void;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+    use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     type CGEventTapProxy = *mut c_void;
@@ -886,6 +884,7 @@ pub mod macos_hook {
     const K_CG_EVENT_OTHER_MOUSE_UP: u32 = 26;
     const K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT: u32 = 0xFFFFFFFE;
     const K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT: u32 = 0xFFFFFFFF;
+    const K_CF_RUN_LOOP_RUN_FINISHED: i32 = 1;
 
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
     const K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1: u32 = 11;
@@ -996,6 +995,7 @@ pub mod macos_hook {
         fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
         fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
         fn CFRunLoopRun();
+        fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
         fn CFRunLoopStop(rl: CFRunLoopRef);
         fn CFRunLoopPerformBlock(rl: CFRunLoopRef, mode: CFStringRef, block: &Block<dyn Fn()>);
         fn CFRunLoopWakeUp(rl: CFRunLoopRef);
@@ -1056,10 +1056,24 @@ pub mod macos_hook {
     static SNAPSHOT_AX: AtomicBool = AtomicBool::new(false);
     static SNAPSHOT_LISTEN: AtomicBool = AtomicBool::new(false);
     static RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
+    static HID_RECONNECT_REQUESTED: AtomicBool = AtomicBool::new(false);
     static LAST_TICK_WALL_MS: AtomicU64 = AtomicU64::new(0);
-    static LAST_HID_RETRY_WALL_MS: AtomicU64 = AtomicU64::new(0);
 
-    pub(super) fn install_wake_observers() {
+    pub(super) fn start_input_listeners() {
+        install_wake_observers();
+        spawn_input_workers(run_event_tap_loop, run_hid_loop);
+    }
+
+    fn spawn_input_workers(
+        event_tap: impl FnOnce() + Send + 'static,
+        hid: impl FnOnce() + Send + 'static,
+    ) -> (JoinHandle<()>, JoinHandle<()>) {
+        // IOHIDManagerOpen/Close can block in a device driver. Keep that work off
+        // the run loop that delivers CGEventTap keyboard and mouse events.
+        (thread::spawn(event_tap), thread::spawn(hid))
+    }
+
+    fn install_wake_observers() {
         let center = NSWorkspace::sharedWorkspace().notificationCenter();
         let observer = RcBlock::new(|_: NonNull<NSNotification>| request_reconnect());
         // NSWorkspace retains these capture-free callbacks for the lifetime of the app.
@@ -1080,6 +1094,7 @@ pub mod macos_hook {
     }
 
     fn request_reconnect() {
+        HID_RECONNECT_REQUESTED.store(true, Ordering::Release);
         if RECONNECT_REQUESTED.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -1595,6 +1610,43 @@ pub mod macos_hook {
         mgr
     }
 
+    fn run_hid_loop() {
+        // A single worker owns the HID manager, even if opening a device is slow.
+        // Other notifications can request a reconnect without spawning more workers.
+        unsafe {
+            let rl = CFRunLoopGetCurrent();
+            loop {
+                HID_RECONNECT_REQUESTED.store(false, Ordering::Release);
+                if !CGPreflightListenEventAccess() {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+
+                let mgr = start_hid_keyboard_listener(rl);
+                if mgr.is_null() {
+                    thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                HID_ACTIVE.store(true, Ordering::Release);
+                while !HID_RECONNECT_REQUESTED.swap(false, Ordering::AcqRel)
+                    && CGPreflightListenEventAccess()
+                {
+                    if CFRunLoopRunInMode(kCFRunLoopDefaultMode, 2.0, 0)
+                        == K_CF_RUN_LOOP_RUN_FINISHED
+                    {
+                        break;
+                    }
+                }
+                HID_ACTIVE.store(false, Ordering::Release);
+                IOHIDManagerRegisterInputValueCallback(mgr, None, std::ptr::null_mut());
+                IOHIDManagerUnscheduleFromRunLoop(mgr, rl, kCFRunLoopCommonModes);
+                IOHIDManagerClose(mgr, K_IO_HID_OPTIONS_TYPE_NONE);
+                CFRelease(mgr);
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+    }
+
     /// Periodic self-healing watchdog running on the exact same CFRunLoop thread.
     /// Automatically tears down & rebuilds listeners when:
     /// 1. The user grants Input Monitoring or Accessibility after launch (no restart needed!)
@@ -1606,6 +1658,9 @@ pub mod macos_hook {
             let now_ms = wall_clock_ms();
             let prev_ms = LAST_TICK_WALL_MS.swap(now_ms, Ordering::AcqRel);
             let woke_from_sleep = prev_ms > 0 && now_ms.saturating_sub(prev_ms) > 12_000;
+            if woke_from_sleep {
+                HID_RECONNECT_REQUESTED.store(true, Ordering::Release);
+            }
 
             let ax_now = AXIsProcessTrusted();
             let listen_now = CGPreflightListenEventAccess();
@@ -1627,20 +1682,7 @@ pub mod macos_hook {
             }
             TAP_ACTIVE.store(!tap.is_null() && !tap_dead, Ordering::Release);
 
-            let hid_needs_retry = !HID_ACTIVE.load(Ordering::Acquire)
-                && listen_now
-                && now_ms.saturating_sub(LAST_HID_RETRY_WALL_MS.load(Ordering::Acquire)) > 15_000;
-
-            if reconnect_requested
-                || ax_upgraded
-                || listen_upgraded
-                || woke_from_sleep
-                || tap_dead
-                || hid_needs_retry
-            {
-                if hid_needs_retry {
-                    LAST_HID_RETRY_WALL_MS.store(now_ms, Ordering::Release);
-                }
+            if reconnect_requested || ax_upgraded || listen_upgraded || woke_from_sleep || tap_dead {
                 CFRunLoopStop(CFRunLoopGetCurrent());
             }
         }
@@ -1654,7 +1696,7 @@ pub mod macos_hook {
         (flags & FLAG_OPTION) != 0
     }
 
-    pub fn run_macos_hook_loop() {
+    fn run_event_tap_loop() {
         let rl = unsafe { CFRunLoopGetCurrent() };
         HOOK_RUN_LOOP.store(rl, Ordering::Release);
 
@@ -1684,7 +1726,6 @@ pub mod macos_hook {
                 if !ax_ok && !listen_ok {
                     TAP_PORT.store(std::ptr::null_mut(), Ordering::Release);
                     TAP_HAS_KEYBOARD.store(false, Ordering::Release);
-                    HID_ACTIVE.store(false, Ordering::Release);
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -1748,21 +1789,7 @@ pub mod macos_hook {
                     TAP_HAS_KEYBOARD.store(false, Ordering::Release);
                 }
 
-                // Channel 2: Non-exclusive read-only IOHIDManager for Keyboard & Keypad.
-                // Receives events directly from physical keyboards AND Karabiner-Elements
-                // DriverKit VirtualHIDKeyboard, even when CGEventTap is blocked by Secure Input
-                // or disrupted by third-party event taps.
-                let hid_mgr = if listen_ok {
-                    start_hid_keyboard_listener(rl)
-                } else {
-                    std::ptr::null_mut()
-                };
-                HID_ACTIVE.store(!hid_mgr.is_null(), Ordering::Release);
-                if hid_mgr.is_null() && listen_ok {
-                    LAST_HID_RETRY_WALL_MS.store(wall_clock_ms(), Ordering::Release);
-                }
-
-                if tap.is_null() && hid_mgr.is_null() {
+                if tap.is_null() {
                     std::thread::sleep(Duration::from_secs(2));
                     continue;
                 }
@@ -1788,13 +1815,6 @@ pub mod macos_hook {
                     CFRunLoopTimerInvalidate(timer);
                     CFRelease(timer as *const c_void);
                 }
-                if !hid_mgr.is_null() {
-                    HID_ACTIVE.store(false, Ordering::Release);
-                    IOHIDManagerRegisterInputValueCallback(hid_mgr, None, std::ptr::null_mut());
-                    IOHIDManagerUnscheduleFromRunLoop(hid_mgr, rl, kCFRunLoopCommonModes);
-                    IOHIDManagerClose(hid_mgr, K_IO_HID_OPTIONS_TYPE_NONE);
-                    CFRelease(hid_mgr as *const c_void);
-                }
                 if !tap.is_null() {
                     TAP_ACTIVE.store(false, Ordering::Release);
                     TAP_PORT.store(std::ptr::null_mut(), Ordering::Release);
@@ -1816,15 +1836,10 @@ pub mod macos_hook {
         use super::*;
         use std::sync::mpsc;
 
-        #[link(name = "CoreFoundation", kind = "framework")]
-        extern "C" {
-            fn CFRunLoopRunInMode(mode: CFStringRef, seconds: f64, return_after_source: u8) -> i32;
-        }
-
         extern "C" fn keep_run_loop_open(_: CFRunLoopTimerRef, _: *mut c_void) {}
 
         #[test]
-        fn workspace_resume_requests_reconnect_without_a_watchdog_gap() {
+        fn workspace_resume_reconnects_event_tap_while_hid_open_is_blocked() {
             install_wake_observers();
             let center = NSWorkspace::sharedWorkspace().notificationCenter();
             for name in unsafe {
@@ -1836,36 +1851,50 @@ pub mod macos_hook {
             } {
                 unsafe { center.postNotificationName_object(name, None) };
                 assert!(RECONNECT_REQUESTED.swap(false, Ordering::AcqRel), "{name}");
+                assert!(HID_RECONNECT_REQUESTED.swap(false, Ordering::AcqRel), "{name}");
             }
 
-            let (ready, wait_for_worker) = mpsc::channel();
-            let worker = std::thread::spawn(move || unsafe {
-                let rl = CFRunLoopGetCurrent();
-                let timer = CFRunLoopTimerCreate(
-                    std::ptr::null(),
-                    CFAbsoluteTimeGetCurrent() + 10.0,
-                    0.0,
-                    0,
-                    0,
-                    keep_run_loop_open,
-                    std::ptr::null_mut(),
-                );
-                assert!(!timer.is_null());
-                CFRunLoopAddTimer(rl, timer, kCFRunLoopDefaultMode);
-                HOOK_RUN_LOOP.store(rl, Ordering::Release);
-                ready.send(()).unwrap();
-                let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3.0, 0);
-                HOOK_RUN_LOOP.store(std::ptr::null_mut(), Ordering::Release);
-                CFRunLoopTimerInvalidate(timer);
-                CFRelease(timer);
-                result
-            });
-            wait_for_worker
-                .recv_timeout(Duration::from_secs(3))
-                .unwrap();
+            let (tap_ready, wait_for_tap) = mpsc::channel();
+            let (tap_result, wait_for_result) = mpsc::channel();
+            let (hid_opening, wait_for_hid) = mpsc::channel();
+            let (unblock_hid, wait_to_unblock) = mpsc::channel();
+            let (tap, hid) = spawn_input_workers(
+                move || unsafe {
+                    let rl = CFRunLoopGetCurrent();
+                    let timer = CFRunLoopTimerCreate(
+                        std::ptr::null(),
+                        CFAbsoluteTimeGetCurrent() + 10.0,
+                        0.0,
+                        0,
+                        0,
+                        keep_run_loop_open,
+                        std::ptr::null_mut(),
+                    );
+                    assert!(!timer.is_null());
+                    CFRunLoopAddTimer(rl, timer, kCFRunLoopDefaultMode);
+                    HOOK_RUN_LOOP.store(rl, Ordering::Release);
+                    tap_ready.send(()).unwrap();
+                    let result = CFRunLoopRunInMode(kCFRunLoopDefaultMode, 3.0, 0);
+                    HOOK_RUN_LOOP.store(std::ptr::null_mut(), Ordering::Release);
+                    CFRunLoopTimerInvalidate(timer);
+                    CFRelease(timer);
+                    tap_result.send(result).unwrap();
+                },
+                move || {
+                    hid_opening.send(()).unwrap();
+                    let _ = wait_to_unblock.recv();
+                },
+            );
+            wait_for_hid.recv_timeout(Duration::from_secs(3)).unwrap();
+            wait_for_tap.recv_timeout(Duration::from_secs(3)).unwrap();
             unsafe { center.postNotificationName_object(NSWorkspaceDidWakeNotification, None) };
+            let result = wait_for_result.recv_timeout(Duration::from_secs(2));
+            unblock_hid.send(()).unwrap();
+            tap.join().unwrap();
+            hid.join().unwrap();
             const K_CF_RUN_LOOP_RUN_STOPPED: i32 = 2;
-            assert_eq!(worker.join().unwrap(), K_CF_RUN_LOOP_RUN_STOPPED);
+            assert_eq!(result.unwrap(), K_CF_RUN_LOOP_RUN_STOPPED);
+            assert!(HID_RECONNECT_REQUESTED.swap(false, Ordering::AcqRel));
         }
     }
 }
